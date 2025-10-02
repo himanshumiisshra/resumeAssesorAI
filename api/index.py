@@ -11,14 +11,14 @@ import fitz  # PyMuPDF for text extraction
 # Load env variables
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-AUTH_SECRET = os.getenv('AUTH_SECRET')
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+AUTH_SECRET = os.getenv("AUTH_SECRET")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise EnvironmentError("GROQ_API_KEY is missing. Please check your .env file.")
 
-GOOGLE_GEMINI_API_KEY = os.getenv('GOOGLE_GEMINI_API_KEY')
+GOOGLE_GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY")
 if not GOOGLE_GEMINI_API_KEY:
     raise EnvironmentError("GOOGLE_GEMINI_API_KEY is missing. Please check your .env file.")
 
@@ -38,9 +38,11 @@ client = Groq(api_key=GROQ_API_KEY)
 app = Flask(__name__)
 CORS(app)
 
-@app.route('/')
+
+@app.route("/")
 def home():
-    return 'your BACKEND AI is LIVE'
+    return "your BACKEND AI is LIVE"
+
 
 def generate_prompt(job_description=None):
     base_prompt = """
@@ -70,7 +72,7 @@ def generate_prompt(job_description=None):
     else:
         prompt = f"""
         {base_prompt}
-         The CV is attached for analysis. Analyze the CV and provide detailed insights. 
+        The CV is attached for analysis. Analyze the CV and provide detailed insights. 
         As no job description is provided, analyze the CV in general and suggest areas for improvement.
         Your output must be in JSON format as follows:
         {{
@@ -85,74 +87,87 @@ def generate_prompt(job_description=None):
 
 def extract_text_from_pdf(pdf_bytes):
     """Extract plain text from PDF bytes using PyMuPDF."""
-    pdf_stream = io.BytesIO(pdf_bytes)
-    doc = fitz.open(stream=pdf_stream, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text("text") + "\n"
-    return text.strip()
+    try:
+        pdf_stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=pdf_stream, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text("text") + "\n"
+        return text.strip()
+    except Exception as e:
+        logging.error(f"PDF extraction error: {e}")
+        raise
 
 
-@app.route('/upload-resume', methods=['POST'])
+@app.route("/upload-resume", methods=["POST"])
 def uploadResume():
-    auth_secret_fetched = request.headers.get('Authorization') or request.headers.get('authorization') \
-                          or request.json.get('authorization') or request.json.get('Authorization')
-    if not auth_secret_fetched:
-        return jsonify({'error': 'Authorization header is required.'}), 401
-    
-    if auth_secret_fetched != AUTH_SECRET:
-        return jsonify({'error': 'Invalid authorization secret.'}), 401
-    
-    job_description = request.form.get('job_description')
+    try:
+        # 🔐 Authorization
+        auth_secret_fetched = (
+            request.headers.get("Authorization")
+            or request.headers.get("authorization")
+            or request.json.get("authorization")
+            or request.json.get("Authorization")
+        )
+        if not auth_secret_fetched:
+            return jsonify({"error": "Authorization header is required."}), 401
+        if auth_secret_fetched != AUTH_SECRET:
+            return jsonify({"error": "Invalid authorization secret."}), 401
 
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
+        # 📄 Resume file
+        job_description = request.form.get("job_description")
+        if "file" not in request.files:
+            return jsonify({"error": "No file part"}), 400
 
-    file = request.files['file']
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "No selected file"}), 400
 
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+        if not file.filename.lower().endswith(".pdf"):
+            return jsonify({"error": "Only PDF files are supported."}), 400
 
-    if file and file.filename.lower().endswith('.pdf'):
+        # ✅ Extract text
+        pdf_bytes = file.read()
+        extracted_text = extract_text_from_pdf(pdf_bytes)
+        if not extracted_text.strip():
+            return jsonify({"error": "Could not extract text from PDF."}), 400
+
+        logging.info(f"Extracted PDF Text (first 500 chars): {extracted_text[:500]}")
+
+        # 🤖 Generate prompt + call Gemini
+        prompt = generate_prompt(job_description=job_description)
+        response = model.generate_content(f"{prompt}\nHere is the resume text:\n{extracted_text}")
+
+        summary = response.text.strip()
+        if summary.startswith("```json") and summary.endswith("```"):
+            summary = summary[7:-3].strip()
+
         try:
-            pdf_bytes = file.read()
+            summary_json = json.loads(summary)
+        except Exception as parse_error:
+            logging.error(f"Error parsing JSON: {parse_error}")
+            return jsonify(
+                {
+                    "error": f"Error parsing JSON from model output: {parse_error}",
+                    "raw_response": summary,
+                    "extracted_text_preview": extracted_text[:1000],
+                }
+            ), 500
 
-            # ✅ Extract text before sending to Gemini
-            extracted_text = extract_text_from_pdf(pdf_bytes)
-            logging.info(f"Extracted PDF Text (first 500 chars): {extracted_text[:500]}")
-
-        except Exception as e:
-            logging.error(f"Error reading or extracting PDF: {e}")
-            return jsonify({"error": f"Error reading or extracting PDF: {e}"}), 500
-
-        try:
-            prompt = generate_prompt(job_description=job_description)
-
-            # Send extracted text instead of PDF file object
-            response = model.generate_content(f"{prompt}\nHere is the resume text:\n{extracted_text}")
-            summary = response.text.strip()
-            
-            if summary.startswith("```json") and summary.endswith("```"):
-                summary = summary[7:-3].strip()
-            
-            try:
-                summary_json = json.loads(summary)
-            except Exception as parse_error:
-                logging.error(f"Error parsing JSON: {parse_error}")
-                return jsonify({"error": f"Error parsing JSON from model output: {parse_error}", 
-                                "raw_response": summary}), 500
-
-            # ✅ Return extracted text as well for debugging
-            return jsonify({
+        return jsonify(
+            {
                 "extracted_text_preview": extracted_text[:1000],  # first 1000 chars
-                "summary": summary_json
-            })
-        except Exception as e:
-            logging.error(f"Error generating summary: {e}")
-            return jsonify({"error": f"Error generating summary: {e}"}), 500
+                "summary": summary_json,
+            }
+        )
+
+    except Exception as e:
+        logging.error(f"Error in uploadResume: {e}")
+        return jsonify({"error": f"Unexpected error: {e}"}), 500
 
 
-# genie route remains unchanged ...
+# genie route remains unchanged...
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app.run(debug=True)
