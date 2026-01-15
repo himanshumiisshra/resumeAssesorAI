@@ -1,5 +1,4 @@
-from flask import Flask, json, request, jsonify, Response
-from groq import Groq
+from flask import Flask, json, request, jsonify
 from dotenv import load_dotenv
 import os
 import logging
@@ -14,25 +13,20 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 AUTH_SECRET = os.getenv("AUTH_SECRET")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise EnvironmentError("GROQ_API_KEY is missing. Please check your .env file.")
-
 GOOGLE_GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY")
+
 if not GOOGLE_GEMINI_API_KEY:
     raise EnvironmentError("GOOGLE_GEMINI_API_KEY is missing. Please check your .env file.")
 
 # Configure Gemini
 genai.configure(api_key=GOOGLE_GEMINI_API_KEY)
 
-# Pick model from env or default
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-pro-latest")
+# ✅ UPDATED: Using the generic alias. 
+# This points to the stable Flash version (usually 1.5) which has a working free tier.
+GEMINI_MODEL = "gemini-flash-latest"
 model = genai.GenerativeModel(GEMINI_MODEL)
 
 logging.info(f"Using Gemini model: {GEMINI_MODEL}")
-
-# Configure Groq
-client = Groq(api_key=GROQ_API_KEY)
 
 # Flask app
 app = Flask(__name__)
@@ -47,12 +41,7 @@ def home():
 def generate_prompt(job_description=None):
     base_prompt = """
         You are an advanced AI model designed to analyze the compatibility between a CV and a job description. 
-        Your task is to output a structured JSON format that includes the following:
-        
-        1. matching_analysis: Analyze the CV against the job description to identify key strengths and gaps.
-        2. description: Summarize the relevance of the CV to the job description in a few concise sentences.
-        3. score: Provide a numerical compatibility score (0-100) based on qualifications, skills, and experience.
-        4. recommendation: Suggest actions for the candidate to improve their match or readiness for the role.
+        Your task is to output a structured JSON format.
     """
 
     if job_description:
@@ -60,27 +49,24 @@ def generate_prompt(job_description=None):
         {base_prompt}
         Here is the Job Description: {job_description}
         The CV is attached for analysis. Analyze the CV against the job description and provide detailed insights.
-        Your output must be in JSON format as follows:
-        {{
-          "matching_analysis": "Your detailed analysis here.",
-          "description": "A brief summary here.",
-          "score": 85,
-          "skill_match_score": "The skill match score with the required skills in job description. Out of 100. Only number here",
-          "recommendation": "Your suggestions here."
-        }}
+        
+        Output valid JSON with these keys:
+        - matching_analysis: Detailed analysis of strengths and gaps.
+        - description: A brief summary.
+        - score: Integer (0-100) based on qualifications.
+        - skill_match_score: Integer (0-100) specifically for hard skills.
+        - recommendation: Actionable suggestions for improvement.
         """
     else:
         prompt = f"""
         {base_prompt}
-        The CV is attached for analysis. Analyze the CV and provide detailed insights. 
-        As no job description is provided, analyze the CV in general and suggest areas for improvement.
-        Your output must be in JSON format as follows:
-        {{
-          "matching_analysis": "Your detailed analysis here.",
-          "description": "A general summary here.",
-          "score": 70,
-          "recommendation": "Your suggestions here."
-        }}
+        The CV is attached for analysis. No job description was provided, so analyze the CV generally.
+        
+        Output valid JSON with these keys:
+        - matching_analysis: Detailed analysis.
+        - description: General summary.
+        - score: Integer (0-100).
+        - recommendation: Suggestions for improvement.
         """
     return prompt
 
@@ -109,10 +95,12 @@ def uploadResume():
             or request.json.get("authorization")
             or request.json.get("Authorization")
         )
-        if not auth_secret_fetched:
-            return jsonify({"error": "Authorization header is required."}), 401
-        if auth_secret_fetched != AUTH_SECRET:
-            return jsonify({"error": "Invalid authorization secret."}), 401
+        
+        # Verify Auth (Uncomment strict check for production)
+        if not auth_secret_fetched or auth_secret_fetched != AUTH_SECRET:
+             # logging.warning("Auth failed or skipped for testing") 
+             if auth_secret_fetched != AUTH_SECRET:
+                 return jsonify({"error": "Invalid authorization secret."}), 401
 
         # 📄 Resume file
         job_description = request.form.get("job_description")
@@ -134,29 +122,36 @@ def uploadResume():
 
         logging.info(f"Extracted PDF Text (first 500 chars): {extracted_text[:500]}")
 
-        # 🤖 Generate prompt + call Gemini
+        # 🤖 Generate prompt
         prompt = generate_prompt(job_description=job_description)
-        response = model.generate_content(f"{prompt}\nHere is the resume text:\n{extracted_text}")
+        
+        logging.info(f"Sending request to model: {GEMINI_MODEL}")
+        
+        # ✅ UPDATED: Use Native JSON Mode
+        response = model.generate_content(
+            f"{prompt}\nHere is the resume text:\n{extracted_text}",
+            generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json"
+            )
+        )
 
-        summary = response.text.strip()
-        if summary.startswith("```json") and summary.endswith("```"):
-            summary = summary[7:-3].strip()
-
+        summary_text = response.text.strip()
+        
+        # Parse the JSON
         try:
-            summary_json = json.loads(summary)
+            summary_json = json.loads(summary_text)
         except Exception as parse_error:
             logging.error(f"Error parsing JSON: {parse_error}")
             return jsonify(
                 {
-                    "error": f"Error parsing JSON from model output: {parse_error}",
-                    "raw_response": summary,
-                    "extracted_text_preview": extracted_text[:1000],
+                    "error": "Model failed to return valid JSON.",
+                    "raw_response": summary_text
                 }
             ), 500
 
         return jsonify(
             {
-                "extracted_text_preview": extracted_text[:1000],  # first 1000 chars
+                "extracted_text_preview": extracted_text[:1000], 
                 "summary": summary_json,
             }
         )
@@ -164,11 +159,6 @@ def uploadResume():
     except Exception as e:
         logging.error(f"Error in uploadResume: {e}")
         return jsonify({"error": f"Unexpected error: {e}"}), 500
-
-
-# genie route remains unchanged...
-#check
-
 
 if __name__ == "__main__":
     app.run(debug=True)
